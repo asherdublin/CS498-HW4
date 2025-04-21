@@ -1,1 +1,101 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+def parse_line(line):
+    term_part, rest = line.split(":", 1)
+    term = term_part.strip()
+    for pair in rest.split("~"):
+        pair = pair.strip().strip(",")
+        if not pair:
+            continue
+        url, clicks = pair.split(":")
+        yield term, url.strip(), int(clicks)
+
+if __name__ == "__main__":
+    spark = SparkSession.builder \
+        .appName("SearchLogPreprocess") \
+        .getOrCreate()
+
+    lines = spark.sparkContext.textFile("searchLog.csv")
+    records = lines.flatMap(parse_line)
+
+    schema = StructType([
+        StructField("term", StringType(), False),
+        StructField("url", StringType(), False),
+        StructField("clicks", IntegerType(), False)
+    ])
+    df = spark.createDataFrame(records, schema)
+
+    df.write.mode("overwrite").json("processed_data")
+
+    spark.stop()
+from flask import Flask, request, jsonify
+from pyspark.sql import SparkSession, functions as F
+
+app = Flask(__name__)
+
+spark = SparkSession.builder \
+    .appName("SearchLogAPI") \
+    .getOrCreate()
+df = spark.read.json("processed_data")  # columns: term, url, clicks
+df.cache()
+
+domain_priority = F.when(F.col("url").endswith(".org"), 1) \
+                   .when(F.col("url").endswith(".edu"), 2) \
+                   .when(F.col("url").endswith(".com"), 3) \
+                   .otherwise(4)
+
+@app.route("/results", methods=["POST"])
+def results():
+    term = request.json.get("term", "")
+    rows = (
+        df.filter(F.col("term") == term)
+          .groupBy("url")
+          .agg(F.sum("clicks").alias("clicks"))
+          .orderBy(F.desc("clicks"), domain_priority)
+          .collect()
+    )
+    return jsonify({"results": {r.url: r.clicks for r in rows}})
+
+@app.route("/trends", methods=["POST"])
+def trends():
+    term = request.json.get("term", "")
+    total = (
+        df.filter(F.col("term") == term)
+          .agg(F.sum("clicks").alias("clicks"))
+          .first()
+    )
+    return jsonify({"clicks": int(total.clicks or 0)})
+
+@app.route("/popularity", methods=["POST"])
+def popularity():
+    url = request.json.get("url", "")
+    total = (
+        df.filter(F.col("url") == url)
+          .agg(F.sum("clicks").alias("clicks"))
+          .first()
+    )
+    return jsonify({"clicks": int(total.clicks or 0)})
+@app.route("/getBestTerms", methods=["POST"])
+def get_best_terms():
+    website = request.json.get("website", "")
+    total_clicks = (
+        df.filter(F.col("url") == website)
+          .agg(F.sum("clicks").alias("total"))
+          .first()
+    )
+    total = total_clicks.total or 0
+    terms_df = (
+        df.filter(F.col("url") == website)
+          .groupBy("term")
+          .agg(F.sum("clicks").alias("clicks"))
+          .filter(F.col("clicks") > 0.05 * total)
+    )
+    best_terms = [row.term for row in terms_df.collect()]
+    return jsonify({"best_terms": best_terms})
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
 
